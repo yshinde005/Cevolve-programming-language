@@ -77,3 +77,72 @@ if (LastChar == '#') {
   LastChar = getchar();
   return ThisChar;
 }
+
+
+//Now let's define our AST (Abstract Syntax tree)
+
+//ExpressionAST will be our base class for all express nodes.
+class ExpressionAST{
+  public: virtual ~ExpressionAST(){}// we use destructor to basically free up the memory
+};
+
+
+//now we create an expression subclass for numeric literals
+class NumExpressionAST : public ExpressionAST{
+  double val;
+
+  public : NumExpressionAST(double val): val(val){}
+};
+
+//exression subclass for referencing varibles
+class VarExpressionAST : public ExpressionAST{
+  string Name;
+  public:
+  VarExpressionAST(const string&Name): Name(Name){}
+};
+
+//exression subclass for binary operators 
+class BinaryExpressionAST: public ExpressionAST{
+  char Op;
+  unique_ptr<ExpressionAST> LHS,RHS;
+  //the unique_ptr<object> will take sole ownership of the object and destroy it will it gets out of scpoe
+
+  public:
+  BinaryExpressionAST(char op,unique_ptr<ExpressionAST> LHS, unique_ptr<ExpressionAST> RHS  ):
+  Op(op), LHS(move(LHS)),RHS(move(RHS)){}
+};
+
+//move will transfer the value of element to element pointed by result
+//expression subclass for function calls
+class CallExpressionAST: public ExpressionAST{
+  string Callee;
+  vector<unique_ptr<ExpressionAST>>Args;  
+  public:
+  CallExpressionAST(const string &Callee, vector<unique_ptr<ExpressionAST>> Args)
+  :Callee(Callee) , Args(move(Args)){}
+};
+
+
+//Prototype for funcions, it'll capture name and arguments 
+class PrototypeAST{
+  string Name;
+  vector<string> Args;
+
+  public :
+  PrototypeAST(const string &name, vector<string> Args)
+  :Name(name),  Args(move(Args)){}
+
+  const string &getName() const {return Name;}
+  };
+
+  //
+  class FunctionAST {
+    unique_ptr<PrototypeAST> Prototype;
+    unique_ptr<ExpressionAST> Body; 
+    
+    public:
+    FunctionAST(unique_ptr<PrototypeAST> Prototype,
+    unique_ptr<ExpressionAST> Body)
+    : Prototype(move(Prototype)), Body(move(Body)) {}
+  };
+
