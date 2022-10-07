@@ -1,16 +1,31 @@
-#include<cctype>
-#include<cstdio>
-#include<cstdlib>
-#include<map>
-#include<memory>
-#include<string>
-#include<utility>
-#include<vector>
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
 
 using namespace std;
+using namespace llvm;
 
-// The lexer returns tokens [0-255]{i.e ASCII} for characters not defined  , otherwise one
-// of these for known things.
+
+
+// // The lexer returns tokens [0-255]{i.e ASCII} for characters not defined  , otherwise one
+// // of these for known things.
+
 enum Token {
   token_eof = -1,
 
@@ -79,11 +94,13 @@ if (LastChar == '#') {
 }
 
 
-//Now let's define our AST (Abstract Syntax tree)
+// //Now let's define our AST (Abstract Syntax tree)
 
+namespace{
 //ExpressionAST will be our base class for all express nodes.
 class ExpressionAST{
-  public: virtual ~ExpressionAST(){}// we use destructor to basically free up the memory
+  public: virtual ~ExpressionAST()= default;// we use destructor to basically free up the memory
+  virtual Value *codegen() = 0;
 };
 
 
@@ -92,13 +109,16 @@ class NumExpressionAST : public ExpressionAST{
   double val;
 
   public : NumExpressionAST(double val): val(val){}
+  Value *codegen() override;
 };
 
 //exression subclass for referencing varibles
 class VarExpressionAST : public ExpressionAST{
   string Name;
   public:
-  VarExpressionAST(const string&Name): Name(Name){}
+  VarExpressionAST(const string &Name): Name(Name){}
+    Value *codegen() override;
+
 };
 
 //exression subclass for binary operators 
@@ -110,6 +130,8 @@ class BinaryExpressionAST: public ExpressionAST{
   public:
   BinaryExpressionAST(char op,unique_ptr<ExpressionAST> LHS, unique_ptr<ExpressionAST> RHS  ):
   Op(op), LHS(move(LHS)),RHS(move(RHS)){}
+
+    Value *codegen() override;
 };
 
 //move will transfer the value of element to element pointed by result
@@ -120,6 +142,8 @@ class CallExpressionAST: public ExpressionAST{
   public:
   CallExpressionAST(const string &Callee, vector<unique_ptr<ExpressionAST>> Args)
   :Callee(Callee) , Args(move(Args)){}
+
+  Value *codegen() override;
 };
 
 
@@ -132,6 +156,7 @@ class PrototypeAST{
   PrototypeAST(const string &name, vector<string> Args)
   :Name(name),  Args(move(Args)){}
 
+Function *codegen();
   const string &getName() const {return Name;}
   };
 
@@ -144,7 +169,11 @@ class PrototypeAST{
     FunctionAST(unique_ptr<PrototypeAST> Prototype,
     unique_ptr<ExpressionAST> Body)
     : Prototype(move(Prototype)), Body(move(Body)) {}
+
+    Function *codegen();
   };
+
+}
 
 //Parser
 // CurrentToken is current token the parser is looking at and
@@ -152,7 +181,7 @@ class PrototypeAST{
 static int CurrentToken;
 static int getNextToken(){
   return CurrentToken = gettoken();
-}
+} 
 
 //an error handling function LogError 
 unique_ptr<ExpressionAST> LogError(const char *Str){
@@ -198,11 +227,11 @@ static unique_ptr<ExpressionAST> ParseIdExpr(){
 
   //call
   getNextToken(); //eat (
-     std::vector<std::unique_ptr<ExpressionAST>> Args;
+     vector<unique_ptr<ExpressionAST>> Args;
   if (CurrentToken != ')') {
     while (1) {
       if (auto Arg = ParseExpression()) //again, defined later
-        Args.push_back(std::move(Arg));
+        Args.push_back(move(Arg));
       else
         return nullptr;
 
@@ -311,6 +340,8 @@ LHS= make_unique<BinaryExpressionAST>(Binop, move(LHS),move(RHS));
   }
 }
 
+
+
 //prototype
 //        ::= id '(' id* ')'
 static unique_ptr<PrototypeAST> ParsePrototype(){
@@ -342,14 +373,24 @@ static unique_ptr<PrototypeAST> ParsePrototype(){
 //defining let expression
 static unique_ptr<FunctionAST> ParseDefinitionLet() {
   getNextToken();  // eat def.
-  auto Proto = ParsePrototype();
-  if (!Proto) return nullptr;
+  auto Prototype = ParsePrototype();
+  if (!Prototype) return nullptr;
 
   if (auto E = ParseExpression())
-    return make_unique<FunctionAST>(move(Proto), move(E));
+    return make_unique<FunctionAST>(move(Prototype), move(E));
   return nullptr;
 }
 
+
+/// toplevelexpr ::= expression
+static unique_ptr<FunctionAST> ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Prototype = make_unique<PrototypeAST>("", vector<string>());
+    return make_unique<FunctionAST>(move(Prototype), move(E));
+  }
+  return nullptr;
+}
 
 //fn :: = function prototype
 static unique_ptr<PrototypeAST> ParseFn() {
@@ -357,19 +398,149 @@ static unique_ptr<PrototypeAST> ParseFn() {
   return ParsePrototype();
 }
 
-/// toplevelexpr ::= expression
-static unique_ptr<FunctionAST> ParseTopLevelExpr() {
-  if (auto E = ParseExpression()) {
-    // Make an anonymous proto.
-    auto Proto = make_unique<PrototypeAST>("", vector<string>());
-    return make_unique<FunctionAST>(move(Proto), move(E));
-  }
+
+
+
+//code generatioin
+static unique_ptr<LLVMContext> TheContext;
+static unique_ptr<Module> TheModule;
+static unique_ptr<IRBuilder<>> Builder;
+static map<string, Value *> NamedValues;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
   return nullptr;
 }
 
+Value *NumExpressionAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(val));
+}
+
+Value *VarExpressionAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    return LogErrorV("Unknown variable name");
+  return V;
+}
+
+Value *BinaryExpressionAST::codegen() {
+  Value *L = LHS->codegen();
+  Value *R = RHS->codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case '+':
+    return Builder->CreateFAdd(L, R, "addtmp");
+  case '-':
+    return Builder->CreateFSub(L, R, "subtmp");
+  case '*':
+    return Builder->CreateFMul(L, R, "multmp");
+  case '<':
+    L = Builder->CreateFCmpULT(L, R, "cmptmp");
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
+  default:
+    return LogErrorV("invalid binary operator");
+  }
+
+Value *CallExpressionAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = TheModule->getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV("Unknown function referenced");
+
+  // If argument mismatch error.
+  if (CalleeF->arg_size() != Args.size())
+    return LogErrorV("Incorrect # arguments passed");
+
+  vector<Value *> ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  vector<Type *> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &Arg : F->args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // First, check for an existing function from a previous 'extern' declaration.
+  Function *TheFunction = TheModule->getFunction(Prototype->getName());
+
+  if (!TheFunction)
+    TheFunction = Prototype->codegen();
+
+  if (!TheFunction)
+    return nullptr;
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+  Builder->SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &Arg : TheFunction->args())
+    NamedValues[string(Arg.getName())] = &Arg;
+
+  if (Value *RetVal = Body->codegen()) {
+    // Finish off the function.
+    Builder->CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction->eraseFromParent();
+  return nullptr;
+}
+
+
+
+
+
+static void InitializeModule(){
+  //Open a new context and module
+  TheContext = make_unique<LLVMContext>();
+  TheModule = make_unique<Module>("JIT driver",*TheContext);
+
+  //create a new builder fot module
+  Builder = make_unique<IRBuilder<>>(*TheContext);
+
+}
+
+
 static void HandleDefination(){
-  if(ParseDefinitionLet()){
-    fprintf(stderr, " Parsed a function defination.\n");
+  if(auto FnAST= ParseDefinitionLet()){
+    if(auto *FnIR = FnAST->codegen()){
+    fprintf(stderr, " Parsed a function defination.(let)\n");
+    FnIR->print(errs());
+      fprintf(stderr, "\n");
+
+    }
   }else{
     //skip token for error recovery
     getNextToken();
@@ -377,8 +548,12 @@ static void HandleDefination(){
 }
 
 static void HandleFn(){
-  if(ParseFn()){
-    fprintf(stderr, " Parsed a function defination.\n");
+  if (auto ProtototypeAST = ParseExtern()) {
+    if (auto *FnIR = PrototypeAST->codegen()) {
+      fprintf(stderr, "Read Fn: ");
+      FnIR->print(errs());
+      fprintf(stderr, "\n");
+    }
   }else{
     //skip token for error recovery
     getNextToken();
@@ -387,9 +562,16 @@ static void HandleFn(){
 
 static void HandleTopLevelExpression(){
   //evaluate a top-level expression into an anonymous function.
-  if(ParseTopLevelExpr()){
-    fprintf(stderr, " Parsed a top level expression.\n");
-  }else{
+   if (auto FnAST = ParseTopLevelExpr()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read top-level expression:");
+      FnIR->print(errs());
+      fprintf(stderr, "\n");
+
+      // Remove the anonymous expression.
+      FnIR->eraseFromParent();
+    }
+  } else{
     //skip token for error recovery
     getNextToken();
   }
@@ -437,6 +619,8 @@ int main() {
   getNextToken();
 
   MainLoop();
+
+  TheModule->print(errs(),nullptr);
 
   return 0;
 }
